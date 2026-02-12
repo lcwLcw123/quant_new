@@ -8,6 +8,7 @@
 - 前视偏差检测
 - 凯利公式仓位管理
 - 动态止损与浮动止盈
+- 完善的错误处理和输入验证
 
 Author: Coding Agent
 Date: 2026-02-12
@@ -15,10 +16,32 @@ Date: 2026-02-12
 
 import numpy as np
 import pandas as pd
-from typing import Dict, List, Tuple, Optional
-from dataclasses import dataclass
+from typing import Dict, List, Tuple, Optional, Any, Union
+from dataclasses import dataclass, field
 from enum import Enum
 import warnings
+import logging
+from datetime import datetime
+from pathlib import Path
+import traceback
+
+
+class BacktestError(Exception):
+    """回测引擎自定义异常基类"""
+    def __init__(self, message: str, details: Optional[Dict] = None):
+        self.message = message
+        self.details = details or {}
+        super().__init__(self.message)
+
+
+class InputValidationError(BacktestError):
+    """输入参数验证错误"""
+    pass
+
+
+class TradeExecutionError(BacktestError):
+    """交易执行错误"""
+    pass
 
 
 class PositionType(Enum):
@@ -26,6 +49,55 @@ class PositionType(Enum):
     NONE = 0
     LONG = 1
     SHORT = -1
+
+
+# 日志配置
+def setup_logger(log_dir: Optional[Path] = None, log_level: int = logging.INFO) -> logging.Logger:
+    """
+    配置日志记录器
+    
+    Args:
+        log_dir: 日志目录（可选）
+        log_level: 日志级别
+        
+    Returns:
+        配置好的Logger实例
+    """
+    logger = logging.getLogger("EnhancedBacktestEngine")
+    logger.setLevel(log_level)
+    
+    # 清除现有处理器
+    logger.handlers.clear()
+    
+    # 控制台处理器
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(log_level)
+    console_format = logging.Formatter(
+        "%(asctime)s | %(levelname)-8s | %(message)s",
+        datefmt="%H:%M:%S"
+    )
+    console_handler.setFormatter(console_format)
+    logger.addHandler(console_handler)
+    
+    # 文件处理器（如果指定目录）
+    if log_dir:
+        try:
+            # 确保 log_dir 是 Path 对象
+            log_dir = Path(log_dir) if isinstance(log_dir, str) else log_dir
+            log_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            file_handler = logging.FileHandler(log_dir / f"backtest_{timestamp}.log", encoding="utf-8")
+            file_handler.setLevel(log_level)
+            file_format = logging.Formatter(
+                "%(asctime)s | %(levelname)-8s | %(funcName)s:%(lineno)d | %(message)s",
+                datefmt="%Y-%m-%d %H:%M:%S"
+            )
+            file_handler.setFormatter(file_format)
+            logger.addHandler(file_handler)
+        except (OSError, PermissionError) as e:
+            logger.warning(f"无法创建日志文件处理器: {e}")
+    
+    return logger
 
 
 @dataclass
@@ -39,6 +111,36 @@ class TradeCostConfig:
     slippage_base: float = 0.001          # 基础滑点 0.1%
     slippage_volatility_factor: float = 0.002  # 波动率滑点系数
     slippage_volume_factor: float = 0.001     # 成交量滑点系数
+    
+    def validate(self) -> None:
+        """验证配置参数的有效性"""
+        errors = []
+        
+        if not 0 <= self.commission_rate <= 1:
+            errors.append(f"commission_rate必须在[0,1]范围内，当前值: {self.commission_rate}")
+        if not 0 <= self.stamp_tax_rate <= 1:
+            errors.append(f"stamp_tax_rate必须在[0,1]范围内，当前值: {self.stamp_tax_rate}")
+        if self.min_commission < 0:
+            errors.append(f"min_commission不能为负数，当前值: {self.min_commission}")
+        if not 0 <= self.impact_cost_rate <= 1:
+            errors.append(f"impact_cost_rate必须在[0,1]范围内，当前值: {self.impact_cost_rate}")
+        if not 0 <= self.max_impact_cost <= 1:
+            errors.append(f"max_impact_cost必须在[0,1]范围内，当前值: {self.max_impact_cost}")
+        if not 0 <= self.slippage_base <= 1:
+            errors.append(f"slippage_base必须在[0,1]范围内，当前值: {self.slippage_base}")
+        
+        if errors:
+            raise InputValidationError(
+                "TradeCostConfig参数验证失败",
+                {"errors": errors, "config": {
+                    'commission_rate': self.commission_rate,
+                    'stamp_tax_rate': self.stamp_tax_rate,
+                    'min_commission': self.min_commission,
+                    'impact_cost_rate': self.impact_cost_rate,
+                    'max_impact_cost': self.max_impact_cost,
+                    'slippage_base': self.slippage_base
+                }}
+            )
 
 
 @dataclass
@@ -72,6 +174,23 @@ class TradeRecord:
             'net_value': round(self.net_value, 2),
             'accumulated_cost': round(self.accumulated_cost, 2)
         }
+    
+    def validate(self) -> None:
+        """验证交易记录的有效性"""
+        if self.trade_id < 0:
+            raise InputValidationError(f"trade_id不能为负数: {self.trade_id}")
+        if self.trade_time < 0:
+            raise InputValidationError(f"trade_time不能为负数: {self.trade_time}")
+        if self.trade_type not in ('BUY', 'SELL', 'CLOSE'):
+            raise InputValidationError(f"无效的交易类型: {self.trade_type}")
+        if self.price < 0:
+            raise InputValidationError(f"price不能为负数: {self.price}")
+        if self.shares <= 0:
+            raise InputValidationError(f"shares必须为正数: {self.shares}")
+        if self.commission < 0:
+            raise InputValidationError(f"commission不能为负数: {self.commission}")
+        if self.stamp_tax < 0:
+            raise InputValidationError(f"stamp_tax不能为负数: {self.stamp_tax}")
 
 
 @dataclass
@@ -91,6 +210,15 @@ class Position:
     def market_value(self) -> float:
         """市值"""
         return self.shares * self.avg_price
+    
+    def validate(self) -> None:
+        """验证持仓信息的有效性"""
+        if self.shares < 0:
+            raise InputValidationError(f"shares不能为负数: {self.shares}")
+        if self.avg_price < 0:
+            raise InputValidationError(f"avg_price不能为负数: {self.avg_price}")
+        if self.entry_price < 0:
+            raise InputValidationError(f"entry_price不能为负数: {self.entry_price}")
 
 
 class EnhancedBacktestEngine:
@@ -103,15 +231,18 @@ class EnhancedBacktestEngine:
     - 前视偏差检测
     - 凯利公式仓位管理
     - 动态止损/浮动止盈
+    - 结构化日志记录
+    - 完善的错误处理
     """
     
     def __init__(
         self,
         initial_capital: float = 100000.0,
         trade_cost_config: Optional[TradeCostConfig] = None,
-        kelly_fraction: float = 0.5,  # 凯利公式系数（降低风险用）
-        risk_free_rate: float = 0.03,  # 无风险利率
-        verbose: bool = True
+        kelly_fraction: float = 0.5,
+        risk_free_rate: float = 0.03,
+        verbose: bool = True,
+        logger: Optional[logging.Logger] = None
     ):
         """
         初始化回测引擎
@@ -122,32 +253,37 @@ class EnhancedBacktestEngine:
             kelly_fraction: 凯利系数（降低风险用）
             risk_free_rate: 年化无风险利率
             verbose: 是否输出详细信息
+            logger: 日志记录器实例（可选）
         """
         self.initial_capital = initial_capital
         self.capital = initial_capital
         self.trade_cost_config = trade_cost_config or TradeCostConfig()
         self.kelly_fraction = kelly_fraction
         self.risk_free_rate = risk_free_rate
-        self.kelly_fraction = kelly_fraction
-        self.risk_free_rate = risk_free_rate
         self.verbose = verbose
+        
+        # 日志记录器
+        self.logger = logger or logging.getLogger("EnhancedBacktestEngine")
         
         # 状态变量
         self.position = Position()
         self.trades: List[TradeRecord] = []
         self.trade_id_counter = 0
         self.look_ahead_bias_detected = False
-        self.look_ahead_bias_warnings = []
+        self.look_ahead_bias_warnings: List[str] = []
         
         # 评估指标缓存
-        self._equity_curve = []
-        self._daily_returns = []
-        self._position_values = []
+        self._equity_curve: List[float] = []
+        self._daily_returns: List[float] = []
+        self._position_values: List[float] = []
         
-    def _log(self, *args, **kwargs):
-        """日志输出"""
+        self.logger.info(f"回测引擎初始化完成，初始资金: ¥{initial_capital:,.2f}")
+        
+    def _log(self, *args, **kwargs) -> None:
+        """日志输出（兼容旧接口）"""
         if self.verbose:
-            print(*args, **kwargs)
+            message = " ".join(str(arg) for arg in args)
+            self.logger.info(message)
     
     def calculate_slippage(
         self,
