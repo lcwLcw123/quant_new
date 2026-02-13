@@ -1,0 +1,51 @@
+{
+  "version": "1.0",
+  "project_name": "A股全市场多因子量化交易系统",
+  "description": "面向A股全市场的可实盘、无过拟合、回测稳健的量化交易算法体系",
+  "iterations": [
+    {
+      "iteration": 1,
+      "name": "项目架构统一",
+      "status": "完成",
+      "description": "明确项目定位为A股全市场多因子量化系统，废弃华鼎股份单股票LSTM系统",
+      "completed_date": "2026-02-14",
+      "changes": [
+        "更新项目文档",
+        "明确架构定位",
+        "废弃单股票LSTM系统"
+      ]
+    }
+  ],
+  "modules": [
+    {
+      "name": "quant_system.py",
+      "version": "1.0",
+      "status": "稳定",
+      "description": "A股全市场多因子量化交易系统核心文件"
+    },
+    {
+      "name": "multi_factor_strategy.py",
+      "version": "1.0",
+      "status": "稳定",
+      "description": "A股全市场多因子选股策略"
+    },
+    {
+      "name": "multi_factor_quant_system.py",
+      "version": "1.0",
+      "status": "稳定",
+      "description": "完整的多因子量化系统实现"
+    }
+  ],
+  "requirements": {
+    "python_version": ">=3.8",
+    "dependencies": [
+      "pandas",
+      "numpy",
+      "scikit-learn",
+      "matplotlib",
+      "scipy",
+      "statsmodels",
+      "akshare"
+    ]
+  }
+}

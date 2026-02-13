@@ -1,0 +1,55 @@
+{
+  "project": "A股全市场多因子量化交易系统",
+  "reviewer": "量化代码审查专家Agent",
+  "review_date": "2026-02-14",
+  "scope": {
+    "files": [
+      "quant_system.py",
+      "multi_factor_strategy.py",
+      "multi_factor_quant_system.py",
+      "backtest_engine.py",
+      "vectorized_backtest.py",
+      "akshare_wrapper.py",
+      "walk_forward_validation.py"
+    ],
+    "focus_areas": [
+      "实盘验证",
+      "过拟合检测",
+      "工程规范",
+      "风险控制",
+      "数据质量",
+      "代码审查"
+    ]
+  },
+  "config": {
+    "实盘验证": {
+      "T+1": true,
+      "涨跌停": true,
+      "手续费": true,
+      "滑点": true,
+      "停牌": true,
+      "流动性": true
+    },
+    "过拟合检测": {
+      "回测框架": true,
+      "样本外验证": true,
+      "参数优化": true
+    },
+    "工程规范": {
+      "代码结构": true,
+      "测试覆盖": true,
+      "异常处理": true
+    },
+    "风险控制": {
+      "VaR": true,
+      "压力测试": true,
+      "止损机制": true,
+      "仓位管理": true
+    },
+    "数据质量": {
+      "数据获取": true,
+      "清洗": true,
+      "因子构建": true
+    }
+  }
+}

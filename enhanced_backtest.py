@@ -229,15 +229,31 @@ if __name__ == "__main__":
     print("简单均线策略回测示例")
     print("=" * 50)
     
-    # 生成模拟价格数据
-    import random
-    random.seed(42)
+    # 从akshare获取真实A股价格数据
+    import akshare as ak
+    import pandas as pd
     
-    price_data = []
-    base_price = 100
-    for i in range(100):
-        base_price += random.gauss(0, 2)
-        price_data.append(base_price)
+    try:
+        # 获取上证指数数据作为示例
+        price_df = ak.stock_zh_a_hist(
+            symbol="sh",  # 上证指数
+            period="daily",
+            start_date="20240101",
+            end_date="20240531"
+        )
+        price_data = price_df['收盘'].tolist()
+        print(f"成功获取真实价格数据，共 {len(price_data)} 个交易日")
+    except Exception as e:
+        print(f"获取真实价格数据失败: {e}")
+        print("将使用简化的模拟数据进行演示")
+        # 创建简化的模拟数据作为备用方案
+        import random
+        random.seed(42)
+        price_data = []
+        base_price = 100
+        for i in range(100):
+            base_price += random.gauss(0, 2)
+            price_data.append(base_price)
     
     # 简单均线策略
     def ma_strategy(price, idx, prices):
