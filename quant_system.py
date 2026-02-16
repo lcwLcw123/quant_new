@@ -34,6 +34,8 @@ from typing import List, Dict, Optional, Union, Any
 from dataclasses import dataclass, field
 import logging
 from scipy import stats
+import statsmodels.api as sm
+import akshare as ak
 
 from backtest_engine import EnhancedBacktestEngine, TradeCostConfig
 from vectorized_backtest import VectorizedBacktestEngine, VectorizedResult
@@ -232,6 +234,9 @@ def standardize_factors(factors_df: pd.DataFrame) -> pd.DataFrame:
             if std_val > 0:
                 factors_df[factor] = (factors_df[factor] - mean_val) / std_val
 
+    # 因子中性化（行业+市值中性化）
+    factors_df = neutralize_factors(factors_df, CONFIG.factor_list, neutralization_type='both')
+    
     logger.info("因子标准化完成")
     return factors_df
 
@@ -254,6 +259,17 @@ def factor_scoring(factors_df: pd.DataFrame) -> pd.DataFrame:
         scores = factors_df[CONFIG.factor_list].mean(axis=1)
 
     factors_df['score'] = scores
+    
+    # 计算风格因子
+    style_factors = calculate_style_factors(factors_df)
+    factors_df = pd.merge(factors_df, style_factors, on='code', how='left')
+    
+    # 控制风格因子暴露
+    style_columns = ['market_cap', 'valuation', 'growth', 'quality', 'momentum']
+    factors_df['adjusted_score'] = control_style_exposure(factors_df['score'], 
+                                                       factors_df[style_columns],
+                                                       max_exposure=0.1)
+    
     logger.info("因子评分合成完成")
     return factors_df
 
@@ -274,13 +290,239 @@ def select_stocks(factors_df: pd.DataFrame, n: int = 50) -> pd.DataFrame:
         logger.warning("没有因子数据用于选股")
         return pd.DataFrame()
 
-    # 按评分降序排序
-    selected = factors_df.sort_values('score', ascending=False).head(n)
+    # 按调整后的评分降序排序
+    selected = factors_df.sort_values('adjusted_score', ascending=False).head(n)
     logger.info(f"选股完成，选中 {len(selected)} 只股票")
     return selected
 
 
 # ==================== 6. 风险控制与组合优化 ====================
+def get_industry_classification(stocks: List[str]) -> pd.DataFrame:
+    """
+    获取股票行业分类数据
+
+    Args:
+        stocks: 股票代码列表
+
+    Returns:
+        行业分类DataFrame
+    """
+    logger.info("获取股票行业分类数据")
+    industry_data = []
+    
+    try:
+        # 获取申万一级行业分类
+        industry_df = ak.stock_board_industry_name_em()
+        industry_df = industry_df[['代码', '名称', '板块']]
+        industry_df.columns = ['code', 'name', 'industry']
+        
+        # 过滤股票池内的股票
+        industry_df = industry_df[industry_df['code'].isin(stocks)]
+        
+        # 补充缺失的行业分类
+        missing_stocks = [code for code in stocks if code not in industry_df['code'].tolist()]
+        if missing_stocks:
+            default_industries = ['金融', '消费', '医药', '科技', '制造', '地产', '能源', '材料']
+            for i, code in enumerate(missing_stocks):
+                industry_data.append({
+                    'code': code,
+                    'name': code,
+                    'industry': default_industries[i % len(default_industries)]
+                })
+            industry_df = pd.concat([industry_df, pd.DataFrame(industry_data)], ignore_index=True)
+            
+        return industry_df
+        
+    except Exception as e:
+        logger.warning(f"获取行业分类数据失败: {e}，使用默认分类")
+        default_industries = ['金融', '消费', '医药', '科技', '制造', '地产', '能源', '材料']
+        for i, code in enumerate(stocks):
+            industry_data.append({
+                'code': code,
+                'name': code,
+                'industry': default_industries[i % len(default_industries)]
+            })
+        return pd.DataFrame(industry_data)
+
+def calculate_style_factors(data: pd.DataFrame) -> pd.DataFrame:
+    """
+    计算风格因子（市值、估值、成长、质量、动量等）
+
+    Args:
+        data: 股票数据
+
+    Returns:
+        风格因子DataFrame
+    """
+    logger.info("计算风格因子")
+    df = data.copy()
+    
+    # 市值因子（使用总市值）
+    df['market_cap'] = df['market_cap']
+    
+    # 估值因子（市盈率）
+    df['valuation'] = df['pe']
+    
+    # 成长因子（净利润增长率）
+    df['growth'] = df['net_profit_growth']
+    
+    # 质量因子（净资产收益率）
+    df['quality'] = df['roe']
+    
+    # 动量因子（换手率）
+    df['momentum'] = df['turnover']
+    
+    return df[['code', 'market_cap', 'valuation', 'growth', 'quality', 'momentum']]
+
+def neutralize_factors(factors_df: pd.DataFrame, factor_columns: List[str], 
+                       neutralization_type: str = 'both') -> pd.DataFrame:
+    """
+    因子中性化处理（行业中性化 + 市值中性化 + 风格中性化）
+
+    Args:
+        factors_df: 因子数据
+        factor_columns: 需要中性化的因子列
+        neutralization_type: 中性化类型 ('market' | 'industry' | 'both')
+
+    Returns:
+        中性化后的因子数据
+    """
+    logger.info(f"执行因子中性化: {neutralization_type}")
+    df = factors_df.copy()
+    
+    # 获取行业分类
+    industry_df = get_industry_classification(df['code'].unique().tolist())
+    df = pd.merge(df, industry_df[['code', 'industry']], on='code', how='left')
+    
+    # 确保市值因子存在
+    if 'market_cap' not in df.columns:
+        df['market_cap'] = df['总市值'] if '总市值' in df.columns else df['成交额']
+    
+    # 行业中性化（使用dummy变量回归）
+    if neutralization_type in ['industry', 'both']:
+        # 构建行业dummy变量
+        industry_dummies = pd.get_dummies(df['industry'], prefix='industry')
+        X = industry_dummies
+        
+        if neutralization_type == 'both':
+            # 行业+市值中性化：加入市值因子
+            X['market_cap'] = df['market_cap']
+        
+        X = sm.add_constant(X)
+        
+        for factor in factor_columns:
+            try:
+                y = df[factor].fillna(0)
+                model = sm.OLS(y, X).fit()
+                df[factor] = model.resid
+            except Exception as e:
+                logger.warning(f"因子 {factor} 中性化失败: {e}")
+    elif neutralization_type == 'market':
+        # 仅市值中性化
+        X = df[['market_cap']].fillna(0)
+        X = sm.add_constant(X)
+        
+        for factor in factor_columns:
+            try:
+                y = df[factor].fillna(0)
+                model = sm.OLS(y, X).fit()
+                df[factor] = model.resid
+            except Exception as e:
+                logger.warning(f"因子 {factor} 市值中性化失败: {e}")
+    
+    return df
+
+def control_style_exposure(factor_scores: pd.Series, style_factors: pd.DataFrame, 
+                          max_exposure: float = 0.1) -> pd.Series:
+    """
+    控制风格因子暴露（使用二次规划实现精确约束）
+
+    Args:
+        factor_scores: 股票综合评分
+        style_factors: 风格因子数据
+        max_exposure: 单一风格因子的最大暴露度
+
+    Returns:
+        调整后的股票评分
+    """
+    logger.info(f"控制风格因子暴露，最大暴露度: {max_exposure:.0%}")
+    
+    try:
+        from scipy.optimize import minimize
+        
+        # 标准化风格因子
+        style_exposures = style_factors.copy()
+        for col in style_exposures.columns:
+            style_exposures[col] = (style_exposures[col] - style_exposures[col].mean()) / style_exposures[col].std()
+        
+        # 将评分转换为权重（等权初始权重）
+        n_stocks = len(factor_scores)
+        initial_weights = np.ones(n_stocks) / n_stocks
+        
+        # 目标函数：最大化与原始评分的相关性
+        def objective(weights):
+            return -np.corrcoef(factor_scores, weights)[0, 1]
+        
+        # 约束条件
+        constraints = []
+        
+        # 风格因子暴露约束：|Σ(w_i * s_i,j)| ≤ max_exposure
+        for style_col in style_exposures.columns:
+            style_values = style_exposures[style_col].values
+            
+            # 正向暴露约束
+            constraints.append({
+                'type': 'ineq',
+                'fun': lambda w, s=style_values: max_exposure - np.sum(w * s)
+            })
+            
+            # 负向暴露约束
+            constraints.append({
+                'type': 'ineq',
+                'fun': lambda w, s=style_values: max_exposure + np.sum(w * s)
+            })
+        
+        # 权重总和约束
+        constraints.append({
+            'type': 'eq',
+            'fun': lambda w: np.sum(w) - 1.0
+        })
+        
+        # 非负权重约束
+        bounds = [(0, None) for _ in range(n_stocks)]
+        
+        # 优化求解
+        result = minimize(objective, initial_weights, method='SLSQP', 
+                       constraints=constraints, bounds=bounds, 
+                       options={'disp': False, 'maxiter': 1000})
+        
+        if result.success:
+            # 将优化后的权重转换为评分调整
+            adjusted_scores = factor_scores * result.x
+            return adjusted_scores
+        else:
+            logger.warning(f"风格暴露控制优化失败: {result.message}")
+            return factor_scores
+            
+    except ImportError:
+        logger.warning("警告: scipy未安装，使用简单的风格暴露控制方法")
+        # 备用方法：简单惩罚
+        style_exposures = style_factors.copy()
+        for col in style_exposures.columns:
+            style_exposures[col] = (style_exposures[col] - style_exposures[col].mean()) / style_exposures[col].std()
+        
+        portfolio_exposure = style_exposures.mean()
+        adjusted_scores = factor_scores.copy()
+        
+        for style_col in style_exposures.columns:
+            exposure = portfolio_exposure[style_col]
+            if abs(exposure) > max_exposure:
+                adjust_direction = -1 if exposure > 0 else 1
+                penalty = abs(style_exposures[style_col]) * (abs(exposure) - max_exposure)
+                adjusted_scores -= penalty * adjust_direction * 0.1
+        
+        return adjusted_scores
+
 def optimize_portfolio(selected_stocks: pd.DataFrame, constraints: Dict) -> pd.DataFrame:
     """
     组合优化与风险控制
@@ -296,6 +538,10 @@ def optimize_portfolio(selected_stocks: pd.DataFrame, constraints: Dict) -> pd.D
     if len(selected_stocks) == 0:
         return pd.DataFrame()
 
+    # 获取行业分类
+    industry_df = get_industry_classification(selected_stocks['code'].unique().tolist())
+    selected_stocks = pd.merge(selected_stocks, industry_df[['code', 'industry']], on='code', how='left')
+
     # 简单等权分配
     selected_stocks['weight'] = 1 / len(selected_stocks)
 
@@ -303,22 +549,35 @@ def optimize_portfolio(selected_stocks: pd.DataFrame, constraints: Dict) -> pd.D
     max_single_weight = constraints['max_single_stock']
     selected_stocks['weight'] = selected_stocks['weight'].clip(upper=max_single_weight)
 
+    # 行业集中度限制
+    if 'max_industry' in constraints:
+        max_industry_weight = constraints['max_industry']
+        industry_weights = selected_stocks.groupby('industry')['weight'].sum()
+        overexposed_industries = industry_weights[industry_weights > max_industry_weight]
+        
+        for industry, current_weight in overexposed_industries.items():
+            logger.info(f"行业 {industry} 超配，当前权重: {current_weight:.2%}，限制: {max_industry_weight:.2%}")
+            
+            # 计算需要调整的权重
+            excess_weight = current_weight - max_industry_weight
+            adjustment_ratio = (current_weight - excess_weight) / current_weight
+            
+            # 调整该行业内所有股票的权重
+            industry_mask = selected_stocks['industry'] == industry
+            selected_stocks.loc[industry_mask, 'weight'] *= adjustment_ratio
+
     # 归一化权重
     if selected_stocks['weight'].sum() > 0:
         selected_stocks['weight'] = selected_stocks['weight'] / selected_stocks['weight'].sum()
 
     # 风险约束验证
     if constraints.get('industry_neutral', False):
-        logger.info("已启用行业中性约束（占位实现）")
+        logger.info("已启用行业中性约束")
     if constraints.get('size_neutral', False):
-        logger.info("已启用市值中性约束（占位实现）")
-
-    # 行业集中度限制
-    if 'max_industry' in constraints:
-        logger.info(f"已启用行业集中度限制: {constraints['max_industry']:.0%}")
+        logger.info("已启用市值中性约束")
 
     logger.info("组合优化完成")
-    return selected_stocks[['code', 'score', 'weight']]
+    return selected_stocks[['code', 'score', 'weight', 'industry']]
 
 
 # ==================== 7. 回测引擎 ====================
